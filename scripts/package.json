@@ -1,0 +1,17 @@
+{
+  "name": "capy-wechat",
+  "version": "1.0.0",
+  "description": "Capy WeChat integration via ClawBot ilink API",
+  "private": true,
+  "scripts": {
+    "setup": "bun setup.ts",
+    "start": "bun service.ts"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5"
+  }
+}
