@@ -48,5 +48,6 @@ Capy 会自动完成所有安装步骤，包括安装依赖、显示二维码（
 ## Requirements
 
 - iOS 微信（最新版）
+- 安卓（最新版）
 - Capy 沙盒（`AI_GATEWAY_API_KEY` 已自动配置）
 
