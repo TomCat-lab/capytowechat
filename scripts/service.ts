@@ -107,6 +107,10 @@ function loadCredentials(): Account {
 
 const AI_GATEWAY_URL = "https://ai-gateway.happycapy.ai/api/v1/chat/completions";
 const AI_MODEL = "anthropic/claude-sonnet-4.6";
+const WEB_MODEL = "perplexity/sonar"; // online model with real-time web access
+
+// Detect if a message likely needs web search
+const WEB_SEARCH_RE = /最新|今天|今日|现在|最近|新闻|天气|股价|汇率|比赛|比分|上映|发布|搜索|查一下|帮我查|联网|网上|搜一下/;
 
 type Role = "user" | "assistant";
 type Message = { role: Role; content: string };
@@ -126,6 +130,10 @@ async function askCasual(userId: string, userMessage: string): Promise<string> {
   const safeInput = userMessage.trim().slice(0, MAX_INPUT_LENGTH);
   addMessage(userId, "user", safeInput);
 
+  // Use online model when query needs web search; otherwise use standard model
+  const needsWeb = WEB_SEARCH_RE.test(safeInput);
+  const model = needsWeb ? WEB_MODEL : AI_MODEL;
+
   const resp = await fetch(AI_GATEWAY_URL, {
     method: "POST",
     headers: {
@@ -133,11 +141,14 @@ async function askCasual(userId: string, userMessage: string): Promise<string> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: AI_MODEL,
-      messages: [
-        { role: "system", content: CASUAL_SYSTEM_PROMPT },
-        ...getHistory(userId),
-      ],
+      model,
+      messages: needsWeb
+        // perplexity/sonar doesn't support system messages with history well; send just the query
+        ? [{ role: "user", content: `${safeInput}\n\n（回复请用中文，不要用 Markdown，直接纯文本，简洁）` }]
+        : [
+            { role: "system", content: CASUAL_SYSTEM_PROMPT },
+            ...getHistory(userId),
+          ],
       max_tokens: 800,
     }),
   });
@@ -162,7 +173,7 @@ async function askWork(userId: string, userMessage: string): Promise<string> {
     "-p",
     "--output-format", "json",
     "--system", WORK_SYSTEM_PROMPT,
-    "--allowedTools", "Bash,Read,Write,Glob,Grep,Edit",
+    "--allowedTools", "Bash,Read,Write,Glob,Grep,Edit,WebFetch",
   ];
   if (sessionId) args.push("--resume", sessionId);
 
