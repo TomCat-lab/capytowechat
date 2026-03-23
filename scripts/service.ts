@@ -112,6 +112,34 @@ const WEB_MODEL = "perplexity/sonar"; // online model with real-time web access
 // Detect if a message likely needs web search
 const WEB_SEARCH_RE = /最新|今天|今日|现在|最近|新闻|天气|股价|汇率|比赛|比分|上映|发布|搜索|查一下|帮我查|联网|网上|搜一下/;
 
+// Detect URLs in messages
+const URL_RE = /https?:\/\/[^\s\u4e00-\u9fff]{4,}/;
+
+// Fetch a URL and return plain-text content (max ~3000 chars)
+async function fetchUrl(url: string): Promise<string | null> {
+  try {
+    const resp = await fetch(url, {
+      signal: AbortSignal.timeout(15_000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; CapyBot/1.0)" },
+    });
+    if (!resp.ok) return null;
+    const ct = resp.headers.get("content-type") ?? "";
+    if (!ct.includes("text") && !ct.includes("html") && !ct.includes("json")) return null;
+    const raw = await resp.text();
+    // Strip HTML tags, collapse whitespace, truncate
+    const plain = raw
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 3000);
+    return plain || null;
+  } catch {
+    return null;
+  }
+}
+
 type Role = "user" | "assistant";
 type Message = { role: Role; content: string };
 const histories = new Map<string, Message[]>();
@@ -128,6 +156,45 @@ function addMessage(userId: string, role: Role, content: string) {
 
 async function askCasual(userId: string, userMessage: string): Promise<string> {
   const safeInput = userMessage.trim().slice(0, MAX_INPUT_LENGTH);
+
+  // ── URL in message: fetch page content and summarise ──────────────────
+  const urlMatch = safeInput.match(URL_RE);
+  if (urlMatch) {
+    const url = urlMatch[0];
+    const pageText = await fetchUrl(url);
+    if (pageText) {
+      // Build a prompt that includes the page content
+      const userQuery = safeInput.replace(url, "").trim();
+      const prompt = userQuery
+        ? `用户发来了这个链接的内容，用户的问题是：${userQuery}\n\n页面内容如下：\n${pageText}`
+        : `用户发来了这个链接，请总结页面的主要内容：\n${pageText}`;
+      addMessage(userId, "user", `[链接: ${url}] ${userQuery || "请总结"}`);
+      const resp = await fetch(AI_GATEWAY_URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.AI_GATEWAY_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: AI_MODEL,
+          messages: [
+            { role: "system", content: CASUAL_SYSTEM_PROMPT },
+            { role: "user", content: prompt + "\n\n（用中文回复，纯文本，不用 Markdown）" },
+          ],
+          max_tokens: 800,
+        }),
+      });
+      if (!resp.ok) throw new Error(`AI Gateway HTTP ${resp.status}`);
+      const data = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      const reply = data.choices?.[0]?.message?.content?.trim() || "抱歉，无法解析该链接，请稍后再试。";
+      addMessage(userId, "assistant", reply);
+      return reply;
+    }
+    // Fallback: can't fetch (auth required, blocked, etc.)
+    addMessage(userId, "user", safeInput);
+    const reply = `抱歉，无法直接访问这个链接（可能需要登录或被限制访问）。\n你可以把页面内容复制给我，我来帮你分析。`;
+    addMessage(userId, "assistant", reply);
+    return reply;
+  }
+
+  // ── Normal message ─────────────────────────────────────────────────────
   addMessage(userId, "user", safeInput);
 
   // Use online model when query needs web search; otherwise use standard model
@@ -143,7 +210,6 @@ async function askCasual(userId: string, userMessage: string): Promise<string> {
     body: JSON.stringify({
       model,
       messages: needsWeb
-        // perplexity/sonar doesn't support system messages with history well; send just the query
         ? [{ role: "user", content: `${safeInput}\n\n（回复请用中文，不要用 Markdown，直接纯文本，简洁）` }]
         : [
             { role: "system", content: CASUAL_SYSTEM_PROMPT },
@@ -296,7 +362,9 @@ interface ImageItem {
   url?: string;       // fallback URL
   thumb_url?: string; // thumbnail URL
   size?: number;
-  aes_key?: string;   // present if image is encrypted
+  aeskey?: string;    // AES key for decryption (actual field name from ilink API)
+  aes_key?: string;   // alias sometimes used
+  media?: string;     // encrypted media blob
 }
 
 interface MessageItem {
@@ -363,7 +431,7 @@ async function extractMessage(msg: WeixinMessage): Promise<ParsedMessage> {
     if (item.type === MSG_ITEM_IMAGE) {
       const imgItem = item.image_item;
       const url = imgItem?.cdn_url ?? imgItem?.url ?? imgItem?.thumb_url;
-      const encrypted = !!imgItem?.aes_key;
+      const encrypted = !!(imgItem?.aeskey ?? imgItem?.aes_key ?? imgItem?.media);
       log(`收到图片消息: has_url=${!!url} encrypted=${encrypted} keys=${Object.keys(imgItem ?? {}).join(",")}`);
       if (url && !encrypted) {
         const img = await downloadImageAsBase64(url);
