@@ -291,10 +291,19 @@ async function postJSON(
 
 // ── Message Types ─────────────────────────────────────────────────────────
 
+interface ImageItem {
+  cdn_url?: string;   // primary CDN URL (if available)
+  url?: string;       // fallback URL
+  thumb_url?: string; // thumbnail URL
+  size?: number;
+  aes_key?: string;   // present if image is encrypted
+}
+
 interface MessageItem {
   type?: number;
   text_item?: { text?: string };
   voice_item?: { text?: string };
+  image_item?: ImageItem;
 }
 
 interface WeixinMessage {
@@ -315,19 +324,97 @@ interface GetUpdatesResp {
 const MSG_TYPE_USER = 1;
 const MSG_TYPE_BOT = 2;
 const MSG_ITEM_TEXT = 1;
+const MSG_ITEM_IMAGE = 2;
 const MSG_ITEM_VOICE = 3;
 const MSG_STATE_FINISH = 2;
 
-function extractText(msg: WeixinMessage): string {
+// Parsed message: text content + optional image for vision models
+interface ParsedMessage {
+  text: string;
+  imageBase64?: string; // base64-encoded image bytes
+  imageMime?: string;   // e.g. "image/jpeg"
+}
+
+async function downloadImageAsBase64(url: string): Promise<{ data: string; mime: string } | null> {
+  try {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    if (!resp.ok) return null;
+    const mime = resp.headers.get("content-type") ?? "image/jpeg";
+    const buf = await resp.arrayBuffer();
+    return { data: Buffer.from(buf).toString("base64"), mime: mime.split(";")[0] };
+  } catch {
+    return null;
+  }
+}
+
+async function extractMessage(msg: WeixinMessage): Promise<ParsedMessage> {
   for (const item of msg.item_list ?? []) {
+    // Log raw item types for debugging unknown types (no content logged)
+    if (item.type !== MSG_ITEM_TEXT && item.type !== MSG_ITEM_VOICE && item.type !== MSG_ITEM_IMAGE) {
+      log(`未知消息类型: type=${item.type} keys=${Object.keys(item).join(",")}`);
+    }
+
     if (item.type === MSG_ITEM_TEXT && item.text_item?.text) {
-      return item.text_item.text;
+      return { text: item.text_item.text };
     }
     if (item.type === MSG_ITEM_VOICE && item.voice_item?.text) {
-      return item.voice_item.text;
+      return { text: item.voice_item.text };
+    }
+    if (item.type === MSG_ITEM_IMAGE) {
+      const imgItem = item.image_item;
+      const url = imgItem?.cdn_url ?? imgItem?.url ?? imgItem?.thumb_url;
+      const encrypted = !!imgItem?.aes_key;
+      log(`收到图片消息: has_url=${!!url} encrypted=${encrypted} keys=${Object.keys(imgItem ?? {}).join(",")}`);
+      if (url && !encrypted) {
+        const img = await downloadImageAsBase64(url);
+        if (img) return { text: "[图片]", imageBase64: img.data, imageMime: img.mime };
+      }
+      if (encrypted) return { text: "[图片（加密，暂不支持识别）]" };
+      return { text: "[图片]" };
     }
   }
-  return "";
+  return { text: "" };
+}
+
+// ── Vision: describe image via claude-sonnet-4.6 (multimodal) ────────────
+
+async function describeImage(
+  userId: string,
+  imageBase64: string,
+  imageMime: string,
+  userText: string,
+): Promise<string> {
+  const apiKey = process.env.AI_GATEWAY_API_KEY;
+  const prompt = userText && userText !== "[图片]"
+    ? userText
+    : "请描述这张图片的内容。用中文，简洁自然，不用 Markdown。";
+
+  const resp = await fetch(AI_GATEWAY_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: AI_MODEL, // claude-sonnet-4.6 supports vision
+      messages: [
+        { role: "system", content: CASUAL_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: imageMime, data: imageBase64 } },
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+      max_tokens: 600,
+    }),
+  });
+
+  if (!resp.ok) throw new Error(`Vision API HTTP ${resp.status}`);
+  const data = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const reply = data.choices?.[0]?.message?.content?.trim() ?? "无法识别图片，请重试。";
+  // Store reply in history for context
+  addMessage(userId, "user", `[用户发送了一张图片] ${prompt}`);
+  addMessage(userId, "assistant", reply);
+  return reply;
 }
 
 // context_token cache: needed to reply to the correct conversation thread
@@ -439,8 +526,8 @@ async function runService(account: Account): Promise<never> {
       for (const msg of resp.msgs ?? []) {
         if (msg.message_type !== MSG_TYPE_USER) continue;
 
-        const text = extractText(msg);
-        if (!text.trim()) continue;
+        const parsed = await extractMessage(msg);
+        if (!parsed.text.trim() && !parsed.imageBase64) continue;
 
         const senderId = msg.from_user_id ?? "unknown";
 
@@ -449,7 +536,8 @@ async function runService(account: Account): Promise<never> {
         }
 
         // Log only non-sensitive metadata
-        log(`收到消息: from=${senderId.split("@")[0]} len=${text.length}`);
+        const msgKind = parsed.imageBase64 ? "图片" : "文字";
+        log(`收到消息: from=${senderId.split("@")[0]} kind=${msgKind} len=${parsed.text.length}`);
 
         const contextToken = contextTokens.get(senderId);
         if (!contextToken) {
@@ -459,11 +547,20 @@ async function runService(account: Account): Promise<never> {
 
         // Call AI and reply
         try {
-          // In work mode, warn user that processing may take a while
-          if (getMode(senderId) === "work" && text.length > 10) {
+          // Image message: use vision model regardless of mode
+          if (parsed.imageBase64) {
+            await sendReply(baseUrl, token, senderId, "识别中，请稍候...", contextToken).catch(() => {});
+            const reply = await describeImage(senderId, parsed.imageBase64, parsed.imageMime ?? "image/jpeg", parsed.text);
+            await sendReply(baseUrl, token, senderId, reply, contextToken);
+            log(`图片识别完成: to=${senderId.split("@")[0]} len=${reply.length}`);
+            continue;
+          }
+
+          // Text message: route by mode
+          if (getMode(senderId) === "work" && parsed.text.length > 10) {
             await sendReply(baseUrl, token, senderId, "正在处理，请稍候...", contextToken).catch(() => {});
           }
-          const { reply } = await askAI(senderId, text);
+          const { reply } = await askAI(senderId, parsed.text);
           await sendReply(baseUrl, token, senderId, reply, contextToken);
           log(`已回复: to=${senderId.split("@")[0]} mode=${getMode(senderId)} len=${reply.length}`);
         } catch (err) {
