@@ -29,21 +29,23 @@ const CREDENTIALS_FILE = path.join(
   "account.json"
 );
 
-const AI_GATEWAY_URL =
-  "https://ai-gateway.happycapy.ai/api/v1/chat/completions";
-const AI_MODEL = "anthropic/claude-sonnet-4.6";
-const MAX_HISTORY_PER_USER = 20; // max messages kept per user conversation
+const WORKSPACE_DIR =
+  process.env.WORKSPACE_DIR ||
+  process.cwd().replace(/\/capy-wechat$/, "");
+const MAX_HISTORY_PER_USER = 20; // max messages kept per user conversation (unused with claude -p sessions)
 const LONG_POLL_MS = 35_000;
 const MAX_FAILURES = 3;
 const BACKOFF_MS = 30_000;
 const RETRY_MS = 2_000;
 const MAX_INPUT_LENGTH = 4_000; // truncate excessively long messages
 
-const SYSTEM_PROMPT = `你是 Capy，一个友好、智能的 AI 助手，通过微信与用户对话。
+const CLAUDE_SYSTEM_PROMPT = `你是 Capy，一个友好、智能的 AI 助手，通过微信与用户对话。
+规则：
 - 用简洁清晰的中文回复，除非用户使用其他语言
-- 不使用 Markdown 格式（微信不渲染它）
+- 不使用 Markdown 格式（微信不渲染它），用纯文本
 - 保持回复简短自然，像真实聊天一样
-- 回答准确，遇到不确定的事情直接说明`;
+- 可以写代码、执行脚本、读写文件来完成用户任务
+- 执行完任务后，用简短文字告诉用户结果`;
 
 // ── Logging (no message content) ─────────────────────────────────────────
 
@@ -82,71 +84,75 @@ function loadCredentials(): Account {
   }
 }
 
-// ── Conversation History (in-memory only) ────────────────────────────────
+// ── Claude Session IDs (per-user conversation continuity) ────────────────
 
-type Role = "user" | "assistant";
-type Message = { role: Role; content: string };
+// Maps WeChat userId -> claude session ID for --resume support
+const claudeSessions = new Map<string, string>();
 
-const histories = new Map<string, Message[]>();
-
-function getHistory(userId: string): Message[] {
-  if (!histories.has(userId)) {
-    histories.set(userId, []);
-  }
-  return histories.get(userId)!;
-}
-
-function addMessage(userId: string, role: Role, content: string) {
-  const history = getHistory(userId);
-  history.push({ role, content });
-  // Cap history to prevent unbounded memory growth
-  if (history.length > MAX_HISTORY_PER_USER) {
-    history.splice(0, history.length - MAX_HISTORY_PER_USER);
-  }
-}
-
-// ── AI Gateway ───────────────────────────────────────────────────────────
+// ── Claude Agent (via claude -p) ──────────────────────────────────────────
 
 async function askAI(userId: string, userMessage: string): Promise<string> {
-  const apiKey = process.env.AI_GATEWAY_API_KEY;
-  if (!apiKey) {
-    throw new Error("AI_GATEWAY_API_KEY environment variable is not set");
-  }
-
   // Sanitize and truncate input
   const safeInput = userMessage.trim().slice(0, MAX_INPUT_LENGTH);
 
-  addMessage(userId, "user", safeInput);
-  const history = getHistory(userId);
+  const sessionId = claudeSessions.get(userId);
 
-  const response = await fetch(AI_GATEWAY_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: AI_MODEL,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history,
-      ],
-      max_tokens: 1000,
-    }),
-  });
+  const args = [
+    "-p",
+    "--output-format", "json",
+    "--system", CLAUDE_SYSTEM_PROMPT,
+    "--allowedTools", "Bash,Read,Write,Glob,Grep,Edit",
+  ];
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`AI Gateway HTTP ${response.status}: ${body}`);
+  if (sessionId) {
+    args.push("--resume", sessionId);
   }
 
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
+  const proc = Bun.spawn(["claude", ...args], {
+    stdin: new TextEncoder().encode(safeInput),
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: WORKSPACE_DIR,
+    env: { ...process.env },
+  });
 
-  const reply = data.choices?.[0]?.message?.content?.trim() || "抱歉，我现在无法回复，请稍后再试。";
-  addMessage(userId, "assistant", reply);
-  return reply;
+  // Timeout: 2 minutes for complex tasks
+  const timeoutHandle = setTimeout(() => {
+    proc.kill();
+    log(`超时终止 claude 进程: user=${userId.split("@")[0]}`);
+  }, 120_000);
+
+  const [stdout, _stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+
+  clearTimeout(timeoutHandle);
+  await proc.exited;
+
+  // Parse JSON output to extract result and session ID
+  try {
+    const parsed = JSON.parse(stdout) as {
+      result?: string;
+      session_id?: string;
+      is_error?: boolean;
+    };
+
+    // Save session ID for conversation continuity
+    if (parsed.session_id) {
+      claudeSessions.set(userId, parsed.session_id);
+    }
+
+    if (parsed.is_error) {
+      logError(`claude 返回错误: ${parsed.result}`);
+      return "抱歉，执行出错了，请稍后再试。";
+    }
+
+    return parsed.result?.trim() || "抱歉，我现在无法回复，请稍后再试。";
+  } catch {
+    // Fallback: return raw stdout if JSON parse fails
+    return stdout.trim() || "抱歉，我现在无法回复，请稍后再试。";
+  }
 }
 
 // ── WeChat ilink API ─────────────────────────────────────────────────────
@@ -369,6 +375,10 @@ async function runService(account: Account): Promise<never> {
 
         // Call AI and reply
         try {
+          // For longer inputs, send a "thinking" message first
+          if (text.length > 30) {
+            await sendReply(baseUrl, token, senderId, "正在处理，请稍候...", contextToken).catch(() => {});
+          }
           const reply = await askAI(senderId, text);
           await sendReply(baseUrl, token, senderId, reply, contextToken);
           log(`已回复: to=${senderId.split("@")[0]} len=${reply.length}`);
@@ -404,12 +414,8 @@ async function runService(account: Account): Promise<never> {
 // ── Entry Point ───────────────────────────────────────────────────────────
 
 async function main() {
-  if (!process.env.AI_GATEWAY_API_KEY) {
-    console.error("错误: 请设置 AI_GATEWAY_API_KEY 环境变量");
-    console.error("  export AI_GATEWAY_API_KEY=<your-key>");
-    console.error("  bun service.ts");
-    process.exit(1);
-  }
+  // claude -p inherits the current environment (ANTHROPIC_BASE_URL etc.)
+  // No extra API key needed — it uses the same auth as the Capy session.
 
   const account = loadCredentials();
   log(`账号加载成功: ${account.accountId}`);
