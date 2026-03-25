@@ -258,7 +258,7 @@ async function askWork(userId: string, userMessage: string): Promise<string> {
   const args = [
     "-p",
     "--output-format", "json",
-    "--system", WORK_SYSTEM_PROMPT,
+    "--system-prompt", WORK_SYSTEM_PROMPT,
     "--allowedTools", "Bash,Read,Write,Glob,Grep,Edit,WebFetch",
   ];
   if (sessionId) args.push("--resume", sessionId);
@@ -557,6 +557,71 @@ async function sendReply(
   );
 }
 
+// ── Typing Indicator ─────────────────────────────────────────────────────
+
+const typingTicketCache = new Map<string, string>(); // userId -> typing_ticket
+
+async function fetchTypingTicket(
+  baseUrl: string,
+  token: string,
+  userId: string,
+  contextToken?: string
+): Promise<string> {
+  try {
+    const resp = await postJSON(baseUrl, token, "ilink/bot/getconfig", {
+      ilink_user_id: userId,
+      context_token: contextToken,
+      base_info: { channel_version: "1.0.0" },
+    }, 8_000) as { ret?: number; typing_ticket?: string };
+    if (resp.ret === 0 && resp.typing_ticket) {
+      typingTicketCache.set(userId, resp.typing_ticket);
+      return resp.typing_ticket;
+    }
+  } catch { /* ignore */ }
+  return typingTicketCache.get(userId) ?? "";
+}
+
+async function sendTypingStatus(
+  baseUrl: string,
+  token: string,
+  userId: string,
+  typingTicket: string,
+  status: 1 | 2  // 1=typing, 2=cancel
+): Promise<void> {
+  try {
+    await postJSON(baseUrl, token, "ilink/bot/sendtyping", {
+      ilink_user_id: userId,
+      typing_ticket: typingTicket,
+      status,
+      base_info: { channel_version: "1.0.0" },
+    }, 5_000);
+  } catch { /* ignore — typing is best-effort */ }
+}
+
+/** Run an async task while keeping the "typing…" indicator alive every 5 s. */
+async function withTyping<T>(
+  baseUrl: string,
+  token: string,
+  userId: string,
+  contextToken: string,
+  task: () => Promise<T>
+): Promise<T> {
+  const ticket = await fetchTypingTicket(baseUrl, token, userId, contextToken);
+  if (!ticket) return task(); // no ticket — skip indicator
+
+  await sendTypingStatus(baseUrl, token, userId, ticket, 1);
+  const keepalive = setInterval(
+    () => sendTypingStatus(baseUrl, token, userId, ticket, 1),
+    5_000
+  );
+  try {
+    return await task();
+  } finally {
+    clearInterval(keepalive);
+    sendTypingStatus(baseUrl, token, userId, ticket, 2).catch(() => {});
+  }
+}
+
 // ── Main Poll Loop ────────────────────────────────────────────────────────
 
 async function runService(account: Account): Promise<never> {
@@ -637,18 +702,18 @@ async function runService(account: Account): Promise<never> {
         try {
           // Image message: use vision model regardless of mode
           if (parsed.imageBase64) {
-            await sendReply(baseUrl, token, senderId, "识别中，请稍候...", contextToken).catch(() => {});
-            const reply = await describeImage(senderId, parsed.imageBase64, parsed.imageMime ?? "image/jpeg", parsed.text);
+            const reply = await withTyping(baseUrl, token, senderId, contextToken, () =>
+              describeImage(senderId, parsed.imageBase64!, parsed.imageMime ?? "image/jpeg", parsed.text)
+            );
             await sendReply(baseUrl, token, senderId, reply, contextToken);
             log(`图片识别完成: to=${senderId.split("@")[0]} len=${reply.length}`);
             continue;
           }
 
           // Text message: route by mode
-          if (getMode(senderId) === "work" && parsed.text.length > 10) {
-            await sendReply(baseUrl, token, senderId, "正在处理，请稍候...", contextToken).catch(() => {});
-          }
-          const { reply } = await askAI(senderId, parsed.text);
+          const { reply } = await withTyping(baseUrl, token, senderId, contextToken, () =>
+            askAI(senderId, parsed.text).then(r => r)
+          );
           await sendReply(baseUrl, token, senderId, reply, contextToken);
           log(`已回复: to=${senderId.split("@")[0]} mode=${getMode(senderId)} len=${reply.length}`);
         } catch (err) {
