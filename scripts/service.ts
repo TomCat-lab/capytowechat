@@ -39,6 +39,22 @@ const BACKOFF_MS = 30_000;
 const RETRY_MS = 2_000;
 const MAX_INPUT_LENGTH = 4_000;
 
+// ── Load persona files ────────────────────────────────────────────────────
+
+const AGENT_DIR = path.join(process.env.HOME || "~", ".happycapy", "agents", "capy-default");
+
+function readAgentFile(name: string): string {
+  try {
+    return fs.readFileSync(path.join(AGENT_DIR, name), "utf-8").trim();
+  } catch {
+    return "";
+  }
+}
+
+const soulMd = readAgentFile("SOUL.md");
+const identityMd = readAgentFile("IDENTITY.md");
+const PERSONA = [soulMd, identityMd].filter(Boolean).join("\n\n");
+
 // ── Mode: casual (chat) or work (full agent) ──────────────────────────────
 
 type UserMode = "casual" | "work";
@@ -53,13 +69,17 @@ const WORK_TRIGGERS  = /^(干活|工作|开工|工作模式|干活模式|#工作
 const CASUAL_TRIGGERS = /^(休闲|聊天|放松|休息|休闲模式|聊天模式|#休闲|#聊天|casual)$/i;
 
 // Prompts
-const CASUAL_SYSTEM_PROMPT = `你是 Capy，一个友好、智能的 AI 助手，通过微信与用户聊天。
+const CASUAL_SYSTEM_PROMPT = `${PERSONA}
+
+你现在通过微信与用户聊天。
 规则：
 - 用简洁清晰的中文回复，除非用户使用其他语言
 - 不使用 Markdown 格式（微信不渲染它），用纯文本
 - 保持回复简短自然，像真实朋友聊天一样`;
 
-const WORK_SYSTEM_PROMPT = `你是 Capy，一个可以真正动手干活的 AI 助手，通过微信接收任务。
+const WORK_SYSTEM_PROMPT = `${PERSONA}
+
+你现在通过微信接收任务，可以真正动手干活。
 规则：
 - 用简洁清晰的中文回复，除非用户使用其他语言
 - 不使用 Markdown 格式（微信不渲染），用纯文本
