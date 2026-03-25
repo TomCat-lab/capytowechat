@@ -39,6 +39,22 @@ const BACKOFF_MS = 30_000;
 const RETRY_MS = 2_000;
 const MAX_INPUT_LENGTH = 4_000;
 
+// ── Load persona files ────────────────────────────────────────────────────
+
+const AGENT_DIR = path.join(process.env.HOME || "~", ".happycapy", "agents", "capy-default");
+
+function readAgentFile(name: string): string {
+  try {
+    return fs.readFileSync(path.join(AGENT_DIR, name), "utf-8").trim();
+  } catch {
+    return "";
+  }
+}
+
+const soulMd = readAgentFile("SOUL.md");
+const identityMd = readAgentFile("IDENTITY.md");
+const PERSONA = [soulMd, identityMd].filter(Boolean).join("\n\n");
+
 // ── Mode: casual (chat) or work (full agent) ──────────────────────────────
 
 type UserMode = "casual" | "work";
@@ -53,13 +69,17 @@ const WORK_TRIGGERS  = /^(干活|工作|开工|工作模式|干活模式|#工作
 const CASUAL_TRIGGERS = /^(休闲|聊天|放松|休息|休闲模式|聊天模式|#休闲|#聊天|casual)$/i;
 
 // Prompts
-const CASUAL_SYSTEM_PROMPT = `你是 Capy，一个友好、智能的 AI 助手，通过微信与用户聊天。
+const CASUAL_SYSTEM_PROMPT = `${PERSONA}
+
+你现在通过微信与用户聊天。
 规则：
 - 用简洁清晰的中文回复，除非用户使用其他语言
 - 不使用 Markdown 格式（微信不渲染它），用纯文本
 - 保持回复简短自然，像真实朋友聊天一样`;
 
-const WORK_SYSTEM_PROMPT = `你是 Capy，一个可以真正动手干活的 AI 助手，通过微信接收任务。
+const WORK_SYSTEM_PROMPT = `${PERSONA}
+
+你现在通过微信接收任务，可以真正动手干活。
 规则：
 - 用简洁清晰的中文回复，除非用户使用其他语言
 - 不使用 Markdown 格式（微信不渲染），用纯文本
@@ -238,7 +258,7 @@ async function askWork(userId: string, userMessage: string): Promise<string> {
   const args = [
     "-p",
     "--output-format", "json",
-    "--system", WORK_SYSTEM_PROMPT,
+    "--system-prompt", WORK_SYSTEM_PROMPT,
     "--allowedTools", "Bash,Read,Write,Glob,Grep,Edit,WebFetch",
   ];
   if (sessionId) args.push("--resume", sessionId);
@@ -537,6 +557,71 @@ async function sendReply(
   );
 }
 
+// ── Typing Indicator ─────────────────────────────────────────────────────
+
+const typingTicketCache = new Map<string, string>(); // userId -> typing_ticket
+
+async function fetchTypingTicket(
+  baseUrl: string,
+  token: string,
+  userId: string,
+  contextToken?: string
+): Promise<string> {
+  try {
+    const resp = await postJSON(baseUrl, token, "ilink/bot/getconfig", {
+      ilink_user_id: userId,
+      context_token: contextToken,
+      base_info: { channel_version: "1.0.0" },
+    }, 8_000) as { ret?: number; typing_ticket?: string };
+    if (resp.ret === 0 && resp.typing_ticket) {
+      typingTicketCache.set(userId, resp.typing_ticket);
+      return resp.typing_ticket;
+    }
+  } catch { /* ignore */ }
+  return typingTicketCache.get(userId) ?? "";
+}
+
+async function sendTypingStatus(
+  baseUrl: string,
+  token: string,
+  userId: string,
+  typingTicket: string,
+  status: 1 | 2  // 1=typing, 2=cancel
+): Promise<void> {
+  try {
+    await postJSON(baseUrl, token, "ilink/bot/sendtyping", {
+      ilink_user_id: userId,
+      typing_ticket: typingTicket,
+      status,
+      base_info: { channel_version: "1.0.0" },
+    }, 5_000);
+  } catch { /* ignore — typing is best-effort */ }
+}
+
+/** Run an async task while keeping the "typing…" indicator alive every 5 s. */
+async function withTyping<T>(
+  baseUrl: string,
+  token: string,
+  userId: string,
+  contextToken: string,
+  task: () => Promise<T>
+): Promise<T> {
+  const ticket = await fetchTypingTicket(baseUrl, token, userId, contextToken);
+  if (!ticket) return task(); // no ticket — skip indicator
+
+  await sendTypingStatus(baseUrl, token, userId, ticket, 1);
+  const keepalive = setInterval(
+    () => sendTypingStatus(baseUrl, token, userId, ticket, 1),
+    5_000
+  );
+  try {
+    return await task();
+  } finally {
+    clearInterval(keepalive);
+    sendTypingStatus(baseUrl, token, userId, ticket, 2).catch(() => {});
+  }
+}
+
 // ── Main Poll Loop ────────────────────────────────────────────────────────
 
 async function runService(account: Account): Promise<never> {
@@ -617,18 +702,18 @@ async function runService(account: Account): Promise<never> {
         try {
           // Image message: use vision model regardless of mode
           if (parsed.imageBase64) {
-            await sendReply(baseUrl, token, senderId, "识别中，请稍候...", contextToken).catch(() => {});
-            const reply = await describeImage(senderId, parsed.imageBase64, parsed.imageMime ?? "image/jpeg", parsed.text);
+            const reply = await withTyping(baseUrl, token, senderId, contextToken, () =>
+              describeImage(senderId, parsed.imageBase64!, parsed.imageMime ?? "image/jpeg", parsed.text)
+            );
             await sendReply(baseUrl, token, senderId, reply, contextToken);
             log(`图片识别完成: to=${senderId.split("@")[0]} len=${reply.length}`);
             continue;
           }
 
           // Text message: route by mode
-          if (getMode(senderId) === "work" && parsed.text.length > 10) {
-            await sendReply(baseUrl, token, senderId, "正在处理，请稍候...", contextToken).catch(() => {});
-          }
-          const { reply } = await askAI(senderId, parsed.text);
+          const { reply } = await withTyping(baseUrl, token, senderId, contextToken, () =>
+            askAI(senderId, parsed.text).then(r => r)
+          );
           await sendReply(baseUrl, token, senderId, reply, contextToken);
           log(`已回复: to=${senderId.split("@")[0]} mode=${getMode(senderId)} len=${reply.length}`);
         } catch (err) {
