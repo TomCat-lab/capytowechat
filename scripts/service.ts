@@ -112,6 +112,123 @@ const WEB_MODEL = "perplexity/sonar"; // online model with real-time web access
 // Detect if a message likely needs web search
 const WEB_SEARCH_RE = /最新|今天|今日|现在|最近|新闻|天气|股价|汇率|比赛|比分|上映|发布|搜索|查一下|帮我查|联网|网上|搜一下/;
 
+// ── Thinking Status (fun "what I'm doing" messages) ─────────────────────
+
+type StatusCategory = {
+  keywords: RegExp;
+  statuses: string[];
+};
+
+const STATUS_CATEGORIES: StatusCategory[] = [
+  {
+    keywords: /代码|编程|bug|python|java|code|程序|函数|api|debug|开发|写个|实现/i,
+    statuses: ["[搬砖中...]", "[沉迷学习...]", "[头秃ing...]", "[疯狂敲键盘...]", "[与 bug 搏斗中...]"],
+  },
+  {
+    keywords: /吃|饭|餐|美食|菜|做饭|外卖|火锅|烧烤|奶茶|咖啡|喝/i,
+    statuses: ["[干饭中...]", "[喝奶茶ing...]", "[馋了...]", "[咕噜咕噜...]"],
+  },
+  {
+    keywords: /工作|上班|加班|开会|出差|项目|老板|甲方|deadline/i,
+    statuses: ["[搬砖中...]", "[摸鱼偷偷回...]", "[忙到飞起...]", "[假装很忙...]"],
+  },
+  {
+    keywords: /电影|剧|综艺|动漫|番|追|看|视频|游戏|玩/i,
+    statuses: ["[追剧中...]", "[吃瓜ing...]", "[玩游戏被打断...]", "[放下手柄回你...]"],
+  },
+  {
+    keywords: /搜|查|找|百科|wiki|资料|论文|文献/i,
+    statuses: ["[吃瓜ing...]", "[翻箱倒柜中...]", "[摸鱼偷偷查...]", "[疯狂翻阅中...]"],
+  },
+  {
+    keywords: /天气|温度|下雨|下雪|出门|穿/i,
+    statuses: ["[等天晴...]", "[看看窗外...]", "[掐指一算...]"],
+  },
+  {
+    keywords: /睡|困|累|疲|晚安|早安|起床|熬夜/i,
+    statuses: ["[数羊中... 第 183 只]", "[打哈欠...]", "[眯一会儿...]", "[困到模糊...]"],
+  },
+  {
+    keywords: /钱|买|价格|多少钱|贵|便宜|优惠|打折/i,
+    statuses: ["[逛街中...]", "[掏钱包...]", "[精打细算ing...]"],
+  },
+];
+
+const DEFAULT_STATUSES = [
+  "[思考中...]",
+  "[发呆中...]",
+  "[胡思乱想...]",
+  "[神游中...]",
+  "[脑子转啊转...]",
+  "[美滋滋地想...]",
+  "[认真思考中...]",
+];
+
+// Track last status per user to avoid repeating
+const lastStatusMap = new Map<string, string>();
+
+function pickThinkingStatus(userId: string, message: string): string {
+  // Check time-based statuses first
+  const hour = new Date().getHours();
+  if (hour >= 23 || hour < 6) {
+    const lateStatuses = ["[数羊中... 第 183 只]", "[夜猫子上线...]", "[深夜食堂营业中...]", "[月亮不睡我不睡...]"];
+    return pickRandom(userId, lateStatuses);
+  }
+
+  // Match by keywords
+  for (const cat of STATUS_CATEGORIES) {
+    if (cat.keywords.test(message)) {
+      return pickRandom(userId, cat.statuses);
+    }
+  }
+
+  // Default
+  return pickRandom(userId, DEFAULT_STATUSES);
+}
+
+function pickRandom(userId: string, arr: string[]): string {
+  const last = lastStatusMap.get(userId);
+  const candidates = arr.length > 1 ? arr.filter((s) => s !== last) : arr;
+  const pick = candidates[Math.floor(Math.random() * candidates.length)];
+  lastStatusMap.set(userId, pick);
+  return pick;
+}
+
+// Detect book / article search requests
+// Matches: 找书《xxx》 / 搜书 xxx / 找文章 xxx / 帮我找《xxx》/ 下载《xxx》etc.
+const BOOK_SEARCH_RE = /^(找书|搜书|帮我找书|找文章|搜文章|帮我找文章|帮找|下载书|找一本)[：: ]*(《[^》]+》|[\S]+.*)/i;
+const BOOK_TITLE_RE = /《([^》]+)》/; // extract title from 《》
+
+// Search for a book or article via perplexity and return info + links
+async function searchBookOrArticle(query: string): Promise<string> {
+  const prompt = `用户想找这本书或文章："${query}"
+
+请搜索并用纯文本（不要Markdown）回复以下内容：
+1. 书名/文章名（确认）
+2. 作者
+3. 一句话简介
+4. 可以免费获取的链接（如 Z-Library、Anna's Archive、豆瓣读书等），直接给出网址，不要用 []() 格式
+5. 如果是文章，给出原文链接
+
+回复要简洁，控制在200字以内。`;
+
+  const resp = await fetch(AI_GATEWAY_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.AI_GATEWAY_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: WEB_MODEL,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 600,
+    }),
+  });
+  if (!resp.ok) throw new Error(`Search API HTTP ${resp.status}`);
+  const data = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  return data.choices?.[0]?.message?.content?.trim() || "抱歉，搜索失败，请稍后重试。";
+}
+
 // Detect URLs in messages
 const URL_RE = /https?:\/\/[^\s\u4e00-\u9fff]{4,}/;
 
@@ -156,6 +273,21 @@ function addMessage(userId: string, role: Role, content: string) {
 
 async function askCasual(userId: string, userMessage: string): Promise<string> {
   const safeInput = userMessage.trim().slice(0, MAX_INPUT_LENGTH);
+
+  // ── Book / article search ──────────────────────────────────────────────
+  const bookMatch = safeInput.match(BOOK_SEARCH_RE);
+  if (bookMatch) {
+    // Extract the query: prefer title inside 《》, otherwise use the raw text after trigger
+    const rawQuery = bookMatch[2] ?? "";
+    const titleMatch = rawQuery.match(BOOK_TITLE_RE);
+    const query = titleMatch ? titleMatch[1] : rawQuery.trim();
+    if (query) {
+      addMessage(userId, "user", safeInput);
+      const reply = await searchBookOrArticle(query);
+      addMessage(userId, "assistant", reply);
+      return reply;
+    }
+  }
 
   // ── URL in message: fetch page content and summarise ──────────────────
   const urlMatch = safeInput.match(URL_RE);
@@ -625,9 +757,10 @@ async function runService(account: Account): Promise<never> {
           }
 
           // Text message: route by mode
-          if (getMode(senderId) === "work" && parsed.text.length > 10) {
-            await sendReply(baseUrl, token, senderId, "正在处理，请稍候...", contextToken).catch(() => {});
-          }
+          // Send a fun "thinking status" before processing
+          const thinkingStatus = pickThinkingStatus(senderId, parsed.text);
+          await sendReply(baseUrl, token, senderId, thinkingStatus, contextToken).catch(() => {});
+
           const { reply } = await askAI(senderId, parsed.text);
           await sendReply(baseUrl, token, senderId, reply, contextToken);
           log(`已回复: to=${senderId.split("@")[0]} mode=${getMode(senderId)} len=${reply.length}`);
